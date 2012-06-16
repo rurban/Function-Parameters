@@ -8,6 +8,7 @@ our $VERSION = '0.05';
 use Carp qw(croak confess);
 use Devel::Declare;
 use B::Hooks::EndOfScope;
+use B::Compiling qw(PL_compiling);
 
 our @CARP_NOT = qw(Devel::Declare);
 
@@ -307,15 +308,19 @@ sub mk_parse {
 
 		my $start = $ctx->{offset};
 
+		warn "XXX 1 (name) line = ${\PL_compiling->line}";
 		_grab_name $ctx unless $spec->{name} eq 'prohibited';
 		$ctx->{name} or croak qq[I was expecting a function name, not "${\substr Devel::Declare::get_linestr, $ctx->{offset}}"] if $spec->{name} eq 'required';
 		my $fname = $ctx->{name} || '(anon)';
+		warn "XXX 2 $fname (params) line = ${\PL_compiling->line}";
 		_grab_params $ctx;
 		if ($ctx->{params} && $ctx->{params} =~ /([\@%]\w+),([\$\@%]\w+)/) {
 			my ($slurpy, $after) = ($1, $2);
 			croak qq[In $declarator $fname: I was expecting ")" after "$slurpy", not "$after"];
 		}
+		warn "XXX 3 $fname (proto) line = ${\PL_compiling->line}";
 		_grab_proto $ctx;
+		warn "XXX 4 $fname (attr) line = ${\PL_compiling->line}";
 		_grab_attr $ctx;
 
 		my $offset = $ctx->{offset};
@@ -325,8 +330,13 @@ sub mk_parse {
 			or croak qq[In $declarator $fname: I was expecting a function body, not "${\substr $linestr, $offset}"];
 
 		my $gen = _generate $ctx, $declarator, $spec->{shift};
+		#$gen .= "\n#line ${\(PL_compiling->line + 1)}\n";
+		#$gen = "\n" . $gen;
 		my $oldlen = $offset + 1 - $start;
 		_substring $linestr, $start, $offset + 1, (' ' x $oldlen) . $gen;
+		warn "XXX 5 $fname (_gen) line = ${\PL_compiling->line} | $gen \n| $linestr\n";
+		Devel::Declare::set_linestr $linestr;
+		warn "XXX 6 $fname (_gen) line = ${\PL_compiling->line}";
 		Devel::Declare::set_linestr $linestr;
 	}
 }
@@ -339,8 +349,9 @@ sub _fini {
 	on_scope_end {
 		my $off = Devel::Declare::get_linestr_offset;
 		my $str = Devel::Declare::get_linestr;
-		substr $str, $off, 0, '})' . ($stmt ? ';' : '');
+		substr $str, $off, 0, "})" . ($stmt ? ';' : '') . "\n";
 		Devel::Declare::set_linestr $str;
+		use Carp (); Carp::cluck "this is how we got here";
 	};
 }
 
