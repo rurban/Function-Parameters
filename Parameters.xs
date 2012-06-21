@@ -138,37 +138,80 @@ static int kw_flags(pTHX_ const char *kw_ptr, STRLEN kw_len, Spec *spec) {
 #include "toke_on_crack.c.inc"
 
 
+static void free_ptr_op(void *vp) {
+	OP **pp = vp;
+	op_free(*pp);
+	Safefree(pp);
+}
+
+#define sv_eq_pvs(SV, S) sv_eq_pvn(SV, "" S "", sizeof (S) - 1)
+
+static int sv_eq_pvn(SV *sv, const char *p, STRLEN n) {
+	STRLEN sv_len;
+	const char *sv_p = SvPV(sv, sv_len);
+	return
+		sv_len == n &&
+		memcmp(sv_p, p, n) == 0
+	;
+}
+
+enum {
+	MY_ATTR_LVALUE = 0x01,
+	MY_ATTR_LOCKED = 0x02,
+	MY_ATTR_METHOD = 0x04,
+	MY_ATTR_SPECIAL = 0x08
+};
+
 static int parse_fun(pTHX_ OP **pop, const char *keyword_ptr, STRLEN keyword_len, const Spec *spec) {
-	SV *gen, *declarator, *params, *sv;
-	int saw_name, saw_colon;
+	SV *declarator;
+	I32 floor_ix;
+	SV *saw_name;
+	AV *params;
+	SV *proto;
+	OP **attrs_sentinel, *body;
+	unsigned builtin_attrs;
+	int saw_colon;
 	STRLEN len;
 	char *s;
 	I32 c;
 
-	gen = sv_2mortal(newSVpvs("sub"));
 	declarator = sv_2mortal(newSVpvn(keyword_ptr, keyword_len));
-	params = sv_2mortal(newSVpvs(""));
 
 	lex_read_space(0);
 
+	builtin_attrs = 0;
+
 	/* function name */
-	saw_name = 0;
+	saw_name = NULL;
 	s = PL_parser->bufptr;
 	if (spec->name != FLAG_NAME_PROHIBITED && (len = S_scan_word(aTHX_ s, TRUE))) {
-		sv_catpvs(gen, " ");
-		sv_catpvn(gen, s, len);
+		saw_name = sv_2mortal(newSVpvn_flags(s, len, PARSING_UTF ? SVf_UTF8 : 0));
 		sv_catpvs(declarator, " ");
-		sv_catpvn(declarator, s, len);
+		sv_catsv(declarator, saw_name);
+
+		if (
+			sv_eq_pvs(saw_name, "BEGIN") ||
+			sv_eq_pvs(saw_name, "END") ||
+			sv_eq_pvs(saw_name, "INIT") ||
+			sv_eq_pvs(saw_name, "CHECK") ||
+			sv_eq_pvs(saw_name, "UNITCHECK")
+		) {
+			builtin_attrs |= MY_ATTR_SPECIAL;
+		}
+
 		lex_read_to(s + len);
 		lex_read_space(0);
-		saw_name = 1;
 	} else if (spec->name == FLAG_NAME_REQUIRED) {
 		croak("I was expecting a function name, not \"%.*s\"", (int)(PL_parser->bufend - s), s);
 	} else {
 		sv_catpvs(declarator, " (anon)");
 	}
 
+	floor_ix = start_subparse(FALSE, saw_name ? 0 : CVf_ANON);
+	SAVEFREESV(PL_compcv);
+
 	/* parameters */
+	params = NULL;
 	c = lex_peek_unichar(0);
 	if (c == '(') {
 		SV *saw_slurpy = NULL;
@@ -176,10 +219,14 @@ static int parse_fun(pTHX_ OP **pop, const char *keyword_ptr, STRLEN keyword_len
 		lex_read_unichar(0);
 		lex_read_space(0);
 
+		params = newAV();
+		sv_2mortal((SV *)params);
+
 		for (;;) {
 			c = lex_peek_unichar(0);
 			if (c == '$' || c == '@' || c == '%') {
-				sv_catpvf(params, "%c", (int)c);
+				SV *param;
+
 				lex_read_unichar(0);
 				lex_read_space(0);
 
@@ -187,14 +234,14 @@ static int parse_fun(pTHX_ OP **pop, const char *keyword_ptr, STRLEN keyword_len
 				if (!(len = S_scan_word(aTHX_ s, FALSE))) {
 					croak("In %"SVf": missing identifier", SVfARG(declarator));
 				}
+				param = sv_2mortal(newSVpvf("%c%.*s", (int)c, (int)len, s));
 				if (saw_slurpy) {
-					croak("In %"SVf": I was expecting \")\" after \"%"SVf"\", not \"%c%.*s\"", SVfARG(declarator), SVfARG(saw_slurpy), (int)c, (int)len, s);
+					croak("In %"SVf": I was expecting \")\" after \"%"SVf"\", not \"%"SVf"\"", SVfARG(declarator), SVfARG(saw_slurpy), SVfARG(param));
 				}
 				if (c != '$') {
-					saw_slurpy = sv_2mortal(newSVpvf("%c%.*s", (int)c, (int)len, s));
+					saw_slurpy = param;
 				}
-				sv_catpvn(params, s, len);
-				sv_catpvs(params, ",");
+				av_push(params, SvREFCNT_inc_simple_NN(param));
 				lex_read_to(s + len);
 				lex_read_space(0);
 
@@ -220,6 +267,7 @@ static int parse_fun(pTHX_ OP **pop, const char *keyword_ptr, STRLEN keyword_len
 	}
 
 	/* prototype */
+	proto = NULL;
 	saw_colon = 0;
 	c = lex_peek_unichar(0);
 	if (c == ':') {
@@ -228,102 +276,145 @@ static int parse_fun(pTHX_ OP **pop, const char *keyword_ptr, STRLEN keyword_len
 
 		c = lex_peek_unichar(0);
 		if (c != '(') {
-			saw_colon = 1;
+			lex_stuff_pvs(":", 0);
+			c = ':';
 		} else {
-			sv = sv_2mortal(newSVpvs(""));
-			if (!S_scan_str(aTHX_ sv, TRUE, TRUE)) {
+			proto = sv_2mortal(newSVpvs(""));
+			if (!S_scan_str(aTHX_ proto, FALSE, FALSE)) {
 				croak("In %"SVf": prototype not terminated", SVfARG(declarator));
 			}
-			sv_catsv(gen, sv);
+			S_check_prototype(declarator, proto);
 			lex_read_space(0);
+			c = lex_peek_unichar(0);
 		}
-	}
-
-	if (saw_name) {
-		len = SvCUR(gen);
-		s = SvGROW(gen, (len + 1) * 2);
-		sv_catpvs(gen, ";");
-		sv_catpvn(gen, s, len);
 	}
 
 	/* attributes */
-	if (SvTRUE(spec->attrs)) {
-		sv_catsv(gen, spec->attrs);
-	}
+	Newx(attrs_sentinel, 1, OP *);
+	*attrs_sentinel = NULL;
+	SAVEDESTRUCTOR(free_ptr_op, attrs_sentinel);
 
-	if (!saw_colon) {
-		c = lex_peek_unichar(0);
+	if (c == ':' || c == '{') {
+
+		if (SvTRUE(spec->attrs) && SvPV_nolen(spec->attrs)[0] == ':') {
+			lex_stuff_sv(spec->attrs, 0);
+			c = ':';
+		}
+
 		if (c == ':') {
-			saw_colon = 1;
 			lex_read_unichar(0);
 			lex_read_space(0);
-		}
-	}
-	if (saw_colon) {
-		for (;;) {
-			s = PL_parser->bufptr;
-			if (!(len = S_scan_word(aTHX_ s, FALSE))) {
-				break;
-			}
-			sv_catpvs(gen, ":");
-			sv_catpvn(gen, s, len);
-			lex_read_to(s + len);
-			lex_read_space(0);
 			c = lex_peek_unichar(0);
-			if (c == '(') {
-				sv = sv_2mortal(newSVpvs(""));
-				if (!S_scan_str(aTHX_ sv, TRUE, TRUE)) {
-					croak("In %"SVf": unterminated attribute parameter in attribute list", SVfARG(declarator));
+
+			for (;;) {
+				SV *attr;
+
+				s = PL_parser->bufptr;
+				if (!(len = S_scan_word(aTHX_ s, FALSE))) {
+					break;
 				}
-				sv_catsv(gen, sv);
+
+				attr = sv_2mortal(newSVpvn_flags(s, len, PARSING_UTF ? SVf_UTF8 : 0));
+
+				lex_read_to(s + len);
 				lex_read_space(0);
 				c = lex_peek_unichar(0);
-			}
-			if (c == ':') {
-				lex_read_unichar(0);
-				lex_read_space(0);
+
+				if (c != '(') {
+					if (sv_eq_pvs(attr, "lvalue")) {
+						builtin_attrs |= MY_ATTR_LVALUE;
+						attr = NULL;
+					} else if (sv_eq_pvs(attr, "locked")) {
+						builtin_attrs |= MY_ATTR_LOCKED;
+						attr = NULL;
+					} else if (sv_eq_pvs(attr, "method")) {
+						builtin_attrs |= MY_ATTR_METHOD;
+						attr = NULL;
+					}
+				} else {
+					SV *sv = sv_2mortal(newSVpvs(""));
+					if (!S_scan_str(aTHX_ sv, TRUE, TRUE)) {
+						croak("In %"SVf": unterminated attribute parameter in attribute list", SVfARG(declarator));
+					}
+					sv_catsv(attr, sv);
+
+					lex_read_space(0);
+					c = lex_peek_unichar(0);
+				}
+
+				if (attr) {
+					*attrs_sentinel = op_append_elem(OP_LIST, *attrs_sentinel, newSVOP(OP_CONST, 0, SvREFCNT_inc_simple_NN(attr)));
+				}
+
+				if (c == ':') {
+					lex_read_unichar(0);
+					lex_read_space(0);
+					c = lex_peek_unichar(0);
+				}
 			}
 		}
 	}
 
 	/* body */
-	c = lex_peek_unichar(0);
 	if (c != '{') {
 		croak("In %"SVf": I was expecting a function body, not \"%c\"", SVfARG(declarator), (int)c);
 	}
-	lex_read_unichar(0);
-	sv_catpvs(gen, "{");
-	if (SvTRUE(spec->shift)) {
-		sv_catpvs(gen, "my");
-		sv_catsv(gen, spec->shift);
-		sv_catpvs(gen, "=shift;");
-	}
-	if (SvCUR(params)) {
-		sv_catpvs(gen, "my(");
-		sv_catsv(gen, params);
-		sv_catpvs(gen, ")=@_;");
+
+	/* munge */
+	{
+		OP *init = NULL;
+		if (params && av_len(params) > -1) {
+			SV *param;
+			OP *left, *right;
+
+			left = NULL;
+			while ((param = av_shift(params)) != &PL_sv_undef) {
+				OP *const var = newOP(OP_PADSV, 0 /*| OPf_WANT_LIST | OPf_PARENS | OPf_MOD*/ | (OPpLVAL_INTRO << 8));
+				var->op_targ = pad_add_name_sv(param, 0, NULL, NULL);
+				//var = newSVREF(var);
+				//fprintf(stderr, "targ = %d\n", (int)var->op_targ);
+				SvREFCNT_dec(param);
+				left = op_append_elem(OP_LIST, left, var);
+			}
+
+			left->op_flags |= OPf_PARENS;
+			right = newAVREF(newGVOP(OP_GV, 0, PL_defgv));
+			init = newASSIGNOP(OPf_STACKED, left, 0, right);
+			init->op_private &= ~OPpASSIGN_COMMON; // XXX
+		}
+
+		body = parse_block(0);
+		body = op_prepend_elem(OP_LINESEQ, init, body);
 	}
 
-	/* named sub */
-	if (saw_name) {
-		/* fprintf(stderr, "! [%.*s]\n", (int)(PL_bufend - PL_bufptr), PL_bufptr); */
-		lex_stuff_sv(gen, SvUTF8(gen));
-		*pop = parse_barestmt(0);
+	/* fprintf(stderr, "! [%.*s]\n", (int)(PL_bufend - PL_bufptr), PL_bufptr); */
+
+	/* it's go time. */
+	{
+		OP *const attrs = *attrs_sentinel;
+		*attrs_sentinel = NULL;
+		SvREFCNT_inc_simple_void(PL_compcv);
+
+		if (!saw_name) {
+			*pop = newANONATTRSUB(
+				floor_ix,
+				proto ? newSVOP(OP_CONST, 0, SvREFCNT_inc_simple_NN(proto)) : NULL,
+				attrs,
+				body
+			);
+			return KEYWORD_PLUGIN_EXPR;
+		}
+
+		newATTRSUB(
+			floor_ix,
+			newSVOP(OP_CONST, 0, SvREFCNT_inc_simple_NN(saw_name)),
+			proto ? newSVOP(OP_CONST, 0, SvREFCNT_inc_simple_NN(proto)) : NULL,
+			attrs,
+			body
+		);
+		*pop = NULL;
 		return KEYWORD_PLUGIN_STMT;
 	}
-
-	/* anon sub */
-	sv_catpvs(gen, "BEGIN{" MY_PKG "::_fini}");
-	/* fprintf(stderr, "!> [%.*s]\n", (int)(PL_bufend - PL_bufptr), PL_bufptr); */
-	lex_stuff_sv(gen, SvUTF8(gen));
-	*pop = parse_arithexpr(0);
-	s = PL_parser->bufptr;
-	if (*s != '}') {
-		croak("%s: internal error: expected '}', found '%c'", MY_PKG, *s);
-	}
-	lex_unstuff(s + 1);
-	/* fprintf(stderr, "!< [%.*s]\n", (int)(PL_bufend - PL_bufptr), PL_bufptr); */
-	return KEYWORD_PLUGIN_EXPR;
 }
 
 static int my_keyword_plugin(pTHX_ char *keyword_ptr, STRLEN keyword_len, OP **op_ptr) {
@@ -342,27 +433,6 @@ static int my_keyword_plugin(pTHX_ char *keyword_ptr, STRLEN keyword_len, OP **o
 
 	return ret;
 }
-
-static int magic_free(pTHX_ SV *sv, MAGIC *mg) {
-	lex_stuff_pvn("}", 1, 0);
-	/* fprintf(stderr, "!~ [%.*s]\n", (int)(PL_bufend - PL_bufptr), PL_bufptr); */
-	return 0;
-}
-
-static int magic_nop(pTHX_ SV *sv, MAGIC *mg) {
-	return 0;
-}
-
-static MGVTBL my_vtbl = {
-	0,           /* get   */
-	0,           /* set   */
-	0,           /* len   */
-	0,           /* clear */
-	magic_free,  /* free  */
-	0,           /* copy  */
-	0,           /* dup   */
-	magic_nop    /* local */
-};
 
 WARNINGS_RESET
 
@@ -384,8 +454,3 @@ WARNINGS_ENABLE {
 	next_keyword_plugin = PL_keyword_plugin;
 	PL_keyword_plugin = my_keyword_plugin;
 } WARNINGS_RESET
-
-void
-_fini()
-	CODE:
-	sv_magicext((SV *)GvHV(PL_hintgv), NULL, PERL_MAGIC_ext, &my_vtbl, NULL, 0);
